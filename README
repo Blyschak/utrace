@@ -1,0 +1,1 @@
+utrace is a Python helper script for tracing function calls in Linux binaries using perf. It supports C++ symbol demangling, automatic debug symbol resolution, and tracing binaries inside Docker containers.

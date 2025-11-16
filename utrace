@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+
+import argparse
+import ctypes
+import ctypes.util
+import fnmatch
+import json
+import os
+import struct
+import subprocess
+import sys
+import textwrap
+import shutil
+import time
+import uuid
+from typing import IO
+
+try:
+    from perfetto.trace_builder.proto_builder import TraceProtoBuilder
+    from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import (
+        TrackEvent,
+        DebugAnnotation,
+    )
+except ImportError:
+    PERFETTO_AVAILABLE = False
+else:
+    PERFETTO_AVAILABLE = True
+
+
+DEFAULT_CONF_PATH = ".probes.json"
+
+
+class CxxABI:
+    libname = (
+        ctypes.util.find_library("stdc++")
+        or ctypes.util.find_library("c++abi")
+        or "libstdc++.so.6"
+    )
+    lib = ctypes.CDLL(libname)
+
+    # Signature: char* __cxa_demangle(const char* mangled_name,
+    #                                 char* output_buffer,
+    #                                 size_t* length,
+    #                                 int* status);
+    __cxa_demangle = lib.__getattr__("__cxa_demangle")
+    __cxa_demangle.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    __cxa_demangle.restype = ctypes.c_char_p
+
+    @staticmethod
+    def is_cxx_symbol(symbol) -> bool:
+        return symbol.startswith("_Z")
+
+    @classmethod
+    def demangle(cls, name: str) -> str:
+        status = ctypes.c_int(0)
+        length = ctypes.c_size_t(0)
+        res = cls.__cxa_demangle(
+            name.encode(), None, ctypes.byref(length), ctypes.byref(status)
+        )
+        if not res or status.value != 0:
+            return name  # return original if demangling fails
+        demangled = ctypes.string_at(res).decode()
+        # TODO: Causes crash:
+        #   __cxa_demangle allocates with malloc -> free using libc free
+        # libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        # libc.free(res)
+        return demangled
+
+
+class Elf:
+    ELFMAG = b"\x7fELF"
+    ELFCLASS64 = 2
+    ELFDATA2LSB = 1
+
+    SHT_SYMTAB = 2
+    SHT_STRTAB = 3
+    SHT_DYNSYM = 11
+
+    PT_NOTE = 4
+    NT_GNU_BUILD_ID = 3
+
+    STT_FUNC = 2
+
+    def __init__(self, file: IO[bytes]):
+        self.file = file
+        self._parse_header()
+        self._parse_sections()
+        self._parse_strtab()
+
+    def _parse_header(self):
+        # e_ident (16 bytes)
+        e_ident = self.file.read(16)
+        if e_ident[:4] != Elf.ELFMAG:
+            raise ValueError("Not an ELF file")
+        if e_ident[4] != Elf.ELFCLASS64:
+            raise ValueError("Not a 64-bit ELF")
+        if e_ident[5] != Elf.ELFDATA2LSB:
+            raise ValueError("Not little-endian ELF")
+
+        # ELF64 header (after e_ident)
+        # Format: e_type(2), e_machine(2), e_version(4), e_entry(8),
+        #         e_phoff(8), e_shoff(8), e_flags(4), e_ehsize(2),
+        #         e_phentsize(2), e_phnum(2), e_shentsize(2),
+        #         e_shnum(2), e_shstrndx(2)
+        elf_header_fmt = "<HHIQQQIHHHHHH"
+        ehdr_rest = self.file.read(struct.calcsize(elf_header_fmt))
+        (
+            e_type,
+            e_machine,
+            e_version,
+            e_entry,
+            e_phoff,
+            e_shoff,
+            e_flags,
+            e_ehsize,
+            e_phentsize,
+            e_phnum,
+            e_shentsize,
+            e_shnum,
+            e_shstrndx,
+        ) = struct.unpack(elf_header_fmt, ehdr_rest)
+
+        self.e_phnum = e_phnum
+        self.e_phoff = e_phoff
+        self.e_phentsize = e_phentsize
+
+        self.e_shnum = e_shnum
+        self.e_shoff = e_shoff
+        self.e_shentsize = e_shentsize
+
+    def _parse_sections(self):
+        # --- Parse section headers ---
+
+        # Section structure:
+        # (sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+        #  sh_size, sh_link, sh_info, sh_addralign, sh_entsize)
+        sh_fmt = "<IIQQQQIIQQ"
+        sh_size = struct.calcsize(sh_fmt)
+        self.sections = []
+        for i in range(self.e_shnum):
+            self.file.seek(self.e_shoff + i * self.e_shentsize)
+            sh = struct.unpack(sh_fmt, self.file.read(sh_size))
+            self.sections.append(sh)
+
+    def _parse_strtab(self):
+        # Load all string tables
+        self.strtabs = {}
+        for idx, sh in enumerate(self.sections):
+            (
+                sh_name,
+                sh_type,
+                sh_flags,
+                sh_addr,
+                sh_offset,
+                sh_size,
+                sh_link,
+                sh_info,
+                sh_addralign,
+                sh_entsize,
+            ) = sh
+            if sh_type == Elf.SHT_STRTAB:
+                self.file.seek(sh_offset)
+                self.strtabs[idx] = self.file.read(sh_size)
+
+    def read_buildid(self) -> str:
+        # Program header (Elf64_Phdr): p_type(4), p_flags(4), p_offset(8),
+        # p_vaddr(8), p_paddr(8), p_filesz(8), p_memsz(8), p_align(8)
+        ph_fmt = "<IIQQQQQQ"
+        ph_size = struct.calcsize(ph_fmt)
+
+        for i in range(self.e_phnum):
+            self.file.seek(self.e_phoff + i * self.e_phentsize)
+            (
+                p_type,
+                p_flags,
+                p_offset,
+                p_vaddr,
+                p_paddr,
+                p_filesz,
+                p_memsz,
+                p_align,
+            ) = struct.unpack(ph_fmt, self.file.read(ph_size))
+
+            if p_type != Elf.PT_NOTE:
+                continue
+
+            # Read entire PT_NOTE segment
+            self.file.seek(p_offset)
+            notes = self.file.read(p_filesz)
+            off = 0
+            while off + 12 <= len(notes):
+                namesz, descsz, n_type = struct.unpack("<III", notes[off : off + 12])
+                off += 12
+                name = notes[off : off + namesz]
+                off += namesz  # align4(namesz)
+                desc = notes[off : off + descsz]
+                off += descsz  # align4(descsz)
+
+                if name.startswith(b"GNU") and n_type == Elf.NT_GNU_BUILD_ID:
+                    buildid = desc.hex()
+                    if len(buildid) != 40:
+                        raise ValueError("Build ID should be 40 hex characters")
+                    return buildid
+
+        raise ValueError("Unable to read buildid")
+
+    def read_symbols(self, demangle=True) -> list[dict]:
+        def read_symbols_from_section(sh_index):
+            sh = self.sections[sh_index]
+            (
+                sh_name,
+                sh_type,
+                sh_flags,
+                sh_addr,
+                sh_offset,
+                sh_size,
+                sh_link,
+                sh_info,
+                sh_addralign,
+                sh_entsize,
+            ) = sh
+            if sh_type not in (Elf.SHT_SYMTAB, Elf.SHT_DYNSYM):
+                return []
+            strtab = self.strtabs.get(sh_link)
+            if not strtab:
+                return []
+            count = sh_size // sh_entsize
+            syms = []
+            self.file.seek(sh_offset)
+            for _ in range(count):
+                st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack(
+                    "<IBBHQQ", self.file.read(sh_entsize)
+                )
+                st_type = st_info & 0xF
+                if st_type != Elf.STT_FUNC:
+                    continue
+                # resolve name
+                name = b""
+                if st_name < len(strtab):
+                    end = strtab.find(b"\x00", st_name)
+                    if end != -1:
+                        name = strtab[st_name:end]
+                name = name.decode(errors="ignore")
+                if name.endswith(".cold"):  # Skip generated cold sections
+                    continue
+                if demangle:
+                    if CxxABI.is_cxx_symbol(name):
+                        name = CxxABI.demangle(name)
+                syms.append(
+                    {
+                        "name": name,
+                        "value": st_value,
+                        "size": st_size,
+                        "info": st_info,
+                        "other": st_other,
+                        "shndx": st_shndx,
+                    }
+                )
+            return syms
+
+        dynsyms, symtab = [], []
+        for idx, _ in enumerate(self.sections):
+            if self.sections[idx][1] == Elf.SHT_DYNSYM:
+                dynsyms = read_symbols_from_section(idx)
+            elif self.sections[idx][1] == Elf.SHT_SYMTAB:
+                symtab = read_symbols_from_section(idx)
+
+        return symtab + dynsyms
+
+
+class SymbolResolver:
+    def __init__(self, symbol_dirs: list[str] | None = None):
+        self.symbol_dirs = [
+            os.path.join("/", "usr", "lib", "debug", ".build-id"),
+            os.path.join(
+                os.getcwd(),
+            ),
+        ]
+        if symbol_dirs is not None:
+            self.symbol_dirs += symbol_dirs
+
+    def _find_debug_symbol_file(self, build_id: str) -> str | None:
+        dir_part = build_id[:2]
+        file_part = build_id[2:] + ".debug"
+
+        for symbol_dir in self.symbol_dirs:
+            debug_path = os.path.join(symbol_dir, dir_part, file_part)
+            if os.path.exists(debug_path):
+                return debug_path
+
+        return None
+
+    def read_symbols(self, path: str) -> list[dict]:
+        with open(path, "rb") as file:
+            elf = Elf(file)
+            build_id = elf.read_buildid()
+        debug_symbol_file = self._find_debug_symbol_file(build_id)
+        if debug_symbol_file is None:  # No debug symbol ELF, read binary itself
+            debug_symbol_file = path
+        with open(debug_symbol_file, "rb") as file:
+            elf = Elf(file)
+            return elf.read_symbols()
+
+
+class Perf:
+    GROUP_NAME = "probes"
+
+    def install_probe(self, path: str, probe: str):
+        def get_event_name():
+            exename = os.path.basename(path)
+            if "0x" in probe:
+                return f"{exename}_{probe.removeprefix('0x')}"
+            else:
+                return probe
+
+        event = get_event_name()
+        subprocess.run(
+            f"perf probe -x {path} --add {self.GROUP_NAME}:{event}={probe}",
+            shell=True,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            f"perf probe -x {path} --add {self.GROUP_NAME}:{event}={probe}%return",
+            shell=True,
+            check=True,
+            capture_output=True,
+        )
+
+    def clear_probes(self):
+        subprocess.run(
+            f"perf probe -d '{self.GROUP_NAME}:*'",
+            shell=True,
+            capture_output=True,
+        )
+
+    def record(self, timeout_sec=None, buf_pages=128):
+        with open("perf.data", "w") as perfdata_file:
+            cmd = [
+                "perf",
+                "record",
+                "--output",
+                perfdata_file.name,
+                "-m",
+                str(buf_pages),
+                "-e",
+                f"{self.GROUP_NAME}:*",
+                "-aR",
+            ]
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+            )
+
+            try:
+                process.wait(timeout=timeout_sec)
+            except (KeyboardInterrupt, subprocess.TimeoutExpired):
+                process.terminate()
+                process.wait()
+
+    def report(self, output_stream: IO[str]):
+        subprocess.check_call(
+            "perf script -F comm,pid,tid,time,event",
+            shell=True,
+            stdout=output_stream,
+            encoding="utf-8",
+        )
+
+
+class PathResolver:
+    def resolve_host_path(self, binary_path: str) -> str:
+        if ":" in binary_path:
+            container_name, binary_path = binary_path.split(":", maxsplit=1)
+            inspect_output = subprocess.check_output(
+                ["docker", "inspect", container_name], encoding="utf-8"
+            )
+            inspect_json = json.loads(inspect_output)
+            merged_dir = inspect_json[0]["GraphDriver"]["Data"]["MergedDir"]
+            upper_dir = inspect_json[0]["GraphDriver"]["Data"]["UpperDir"]
+            lower_dirs = inspect_json[0]["GraphDriver"]["Data"]["LowerDir"].split(":")
+
+            merged_dir_binary_path = merged_dir + binary_path
+            upper_dir_binary_path = upper_dir + binary_path
+
+            if not os.path.exists(merged_dir_binary_path):
+                raise FileNotFoundError(
+                    f"Binary {binary_path} not found in container {container_name}"
+                )
+            # Return upper dir binary path since you probably override binary in the container
+            if os.path.exists(upper_dir_binary_path):
+                return upper_dir_binary_path
+            for lower_dir in lower_dirs:
+                lower_dir_binary_path = lower_dir + binary_path
+                if os.path.exists(lower_dir_binary_path):
+                    return lower_dir_binary_path
+
+            assert os.path.samefile(merged_dir_binary_path, upper_dir_binary_path)
+            raise AssertionError(
+                "BUG: Binary not found in lower dirs but exists in container"
+            )
+        else:
+            if not os.path.exists(binary_path):
+                raise FileNotFoundError(f"Binary {binary_path} not found")
+            return binary_path
+
+
+class JsonReporter:
+    def on_event(self, event: dict):
+        json.dump(event, sys.stdout)
+        print()
+
+    def end_of_events(self):
+        pass
+
+
+class PerfettoReporter:
+    TRUSTED_PACKET_SEQUENCE_ID = 3003
+
+    def __init__(self):
+        if not PERFETTO_AVAILABLE:
+            print(
+                "Failed to import perfetto library, install using `pip install perfetto`",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        self.builder = TraceProtoBuilder()
+        self.tracks = {}
+
+    def define_track(self, group_name, parent_track_uuid=None):
+        track_uuid = uuid.uuid4().int & ((1 << 63) - 1)
+        packet = self.builder.add_packet()
+        packet.track_descriptor.uuid = track_uuid
+        packet.track_descriptor.name = group_name
+        if parent_track_uuid:
+            packet.track_descriptor.parent_uuid = parent_track_uuid
+        return track_uuid
+
+    def add_event(
+        self,
+        timestamp: float,
+        event_type,
+        event_track_uuid,
+        name="",
+        flow_ids=None,
+        msg=None,
+    ):
+        packet = self.builder.add_packet()
+        packet.timestamp = int(timestamp * 1_000_000_000)
+        packet.track_event.type = event_type
+        packet.track_event.track_uuid = event_track_uuid
+        packet.track_event.log_message.body_iid = packet.timestamp
+        if name:
+            packet.track_event.name = name
+        if flow_ids:
+            for flow_id in flow_ids:
+                packet.track_event.flow_ids.append(flow_id)
+        packet.trusted_packet_sequence_id = self.TRUSTED_PACKET_SEQUENCE_ID
+
+    def on_event(self, event: dict):
+        if event["event"] == "probe":
+            process, pid, tid, ts, kind, func = (
+                event["command"],
+                event["pid"],
+                event["tid"],
+                event["time_ns"],
+                event["kind"],
+                event["func"],
+            )
+            ts = int(ts) / 1_000_000_000
+
+            if pid in self.tracks:
+                track = self.tracks[pid]
+            else:
+                track = self.define_track(process)
+                self.tracks[pid] = track
+
+            if tid in self.tracks:
+                track = self.tracks[tid]
+            else:
+                track = self.define_track(tid, parent_track_uuid=track)
+                self.tracks[tid] = track
+
+            if kind == "enter":
+                self.add_event(ts, TrackEvent.TYPE_SLICE_BEGIN, track, func, msg=func)
+            else:
+                self.add_event(ts, TrackEvent.TYPE_SLICE_END, track, func, msg=func)
+
+    def end_of_events(self):
+        with open("trace.pftrace", "wb") as out:
+            out.write(self.builder.serialize())
+            print(f"Written to: {out.name}")
+
+
+class Tracer:
+    def __init__(self, symbol_resolver: SymbolResolver, conf_path: str = "probes.json"):
+        self.symbol_resolver = symbol_resolver
+        self.path_resolver = PathResolver()
+        self.perf = Perf()
+        self.conf_path = conf_path
+        self.probes = self._read_probes()
+
+    def add_probes(self, path: str, pattern: str):
+        path = self.path_resolver.resolve_host_path(path)
+        for symbol in self.symbol_resolver.read_symbols(path):
+            if fnmatch.fnmatch(symbol["name"], pattern):
+                exename = os.path.basename(path)  # TODO: .so handling ?
+                name = symbol["name"]
+                offset = hex(symbol["value"])
+                probes = self.probes.setdefault(
+                    exename,
+                    {
+                        "path": os.path.abspath(path),
+                        "symbols": {},
+                    },
+                )
+                probes["symbols"][offset] = name
+                print(f"Added probe {exename} at {offset} {name}")
+        self._write_probes()
+
+    def list_probes(self, path: str):
+        path = self.path_resolver.resolve_host_path(path)
+        for symbol in self.symbol_resolver.read_symbols(path):
+            name = symbol["name"]
+            print(name)
+
+    def record(self, timeout_sec=None):
+        if os.geteuid() != 0:
+            print("Root priviledges are required", file=sys.stderr)
+            sys.exit(1)
+        try:
+            self.perf.clear_probes()
+            for _exename, entry in self.probes.items():
+                path = entry["path"]
+                for offset, _name in entry["symbols"].items():
+                    self.perf.install_probe(path, offset)
+
+            self.perf.record(timeout_sec=timeout_sec)
+        finally:
+            self.perf.clear_probes()
+
+    def report(self, reporter_name):
+        # Choose reporter:
+        match reporter_name:
+            case "json":
+                reporter = JsonReporter()
+            case "perfetto":
+                reporter = PerfettoReporter()
+            case _:
+                raise ValueError(f"Invalid reporter: {reporter_name}")
+        # Open pipe to read from `perf script`:
+        r, w = os.pipe()
+        r = os.fdopen(r, "r", encoding="utf-8")
+        w = os.fdopen(w, "w", encoding="utf-8")
+        self.perf.report(w)
+        w.close()
+        # Time sync events:
+        for _ in range(3):
+            # REALTIME (wall clock, same as system time)
+            realtime = time.clock_gettime(time.CLOCK_REALTIME)
+            # BOOTTIME (monotonic time since system boot, including suspend)
+            boottime = time.clock_gettime(time.CLOCK_BOOTTIME)
+            event = {
+                "event": "time_sync",
+                "realtime": realtime,
+                "boottime": boottime,
+            }
+            reporter.on_event(event)
+        # Read from pipe:
+        for line in r.readlines():
+            command, pid_tid, time_str, event = line.split()
+            pid, tid = pid_tid.split("/")
+            time_str = time_str.rstrip(":")
+            time_ns = int(float(time_str) * 1e9)
+            event = event.rstrip(":")
+            _group, name = event.split(":")
+            exename, offset, *_ = name.split("_")
+            offset = "0x" + offset
+            is_return = event.endswith("_return")
+            symbol_name = self.probes[exename]["symbols"][offset]
+            kind = "enter" if not is_return else "exit"
+            event = {
+                "event": "probe",
+                "command": command,
+                "pid": pid,
+                "tid": tid,
+                "time_ns": time_ns,
+                "kind": kind,
+                "func": symbol_name,
+            }
+            reporter.on_event(event)
+        reporter.end_of_events()
+
+    def _read_probes(self) -> dict:
+        try:
+            with open(self.conf_path) as f:
+                return json.load(f)
+        except (FileNotFoundError, ValueError):
+            pass
+
+        return {}
+
+    def _write_probes(self):
+        with open(self.conf_path, "w") as f:
+            json.dump(self.probes, f, indent=4)
+
+    def clear_probes(self):
+        os.remove(self.conf_path)
+
+
+def main():
+    if not shutil.which("perf"):
+        print("perf is required but not installed on the system", file=sys.stderr)
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent("""\
+            Tracer helper script.
+
+            This script uses Linux user space probes to trace function calls.
+            It provides a wrapper interfaces to raw perf commands for easier use.
+
+            What it adds on top of perf:
+                - resolving direct executable paths inside Docker containers
+                - support C++ symbols demangling
+                - adding probes by pattern
+                - providing user friendly output
+        """),
+        epilog=textwrap.dedent("""\
+            Examples:
+
+            # Add probes that match 'Foo::do*' in the app binary inside the container my_container
+            ./utrace add-probes my_container:/usr/bin/app 'Foo::do*'
+        """),
+    )
+    parser.add_argument(
+        "--debugdir",
+        type=str,
+        default=None,
+        help="Debug directories to search for symbols",
+    )
+    parser.add_argument(
+        "--conf", type=str, default=DEFAULT_CONF_PATH, help="Config path"
+    )
+    subparsers = parser.add_subparsers(title="Commands", dest="subcommand")
+    list_probes_parser = subparsers.add_parser(
+        "list-probes", help="List probes for a binary"
+    )
+    list_probes_parser.add_argument("binary", type=str, help="Path to the binary")
+    add_probes_parser = subparsers.add_parser(
+        "add-probes", help="Add probes to a binary"
+    )
+    add_probes_parser.add_argument("binary", type=str, help="Path to the binary")
+    add_probes_parser.add_argument(
+        "patterns", type=str, nargs="+", help="Patterns to match"
+    )
+    _clear_probes_parser = subparsers.add_parser(
+        "clear-probes", help="Clear all probes"
+    )
+    record_parser = subparsers.add_parser("record", help="Record a trace")
+    record_parser.add_argument(
+        "--timeout", type=int, default=None, help="Timeout in seconds"
+    )
+    report_parser = subparsers.add_parser("report", help="Report the trace")
+    report_parser.add_argument(
+        "--reporter",
+        choices=["json", "perfetto"],
+        default="json",
+        help="Reporter to use",
+    )
+
+    args = parser.parse_args()
+
+    sym_dirs = []
+    if args.debugdir:
+        sym_dirs.append(args.debugdir)
+
+    symbol_resolver = SymbolResolver(symbol_dirs=sym_dirs)
+    tracer = Tracer(symbol_resolver, args.conf)
+
+    match args.subcommand:
+        case "add-probes":
+            path = args.binary
+            patterns = args.patterns
+            for pattern in patterns:
+                # TODO: Kernel symbols
+                tracer.add_probes(path, pattern)
+        case "clear-probes":
+            tracer.clear_probes()
+        case "list-probes":
+            tracer.list_probes(args.binary)
+        case "record":
+            tracer.record(timeout_sec=args.timeout)
+        case "report":
+            tracer.report(args.reporter)
+
+
+if __name__ == "__main__":
+    main()
+
