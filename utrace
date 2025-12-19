@@ -357,6 +357,7 @@ class Perf:
                 stdout=subprocess.PIPE,
                 stderr=sys.stderr,
             )
+            print("Recording started...")
 
             try:
                 process.wait(timeout=timeout_sec)
@@ -535,6 +536,7 @@ class Tracer:
             print("Root priviledges are required", file=sys.stderr)
             sys.exit(1)
         try:
+            # TODO: Validate same binary by storing buildid in probes.json and compare to buildid of the binary under profile.
             self.perf.clear_probes()
             for _exename, entry in self.probes.items():
                 path = entry["path"]
@@ -643,7 +645,7 @@ def main():
         "--debugdir",
         type=str,
         default=None,
-        help="Debug directories to search for symbols",
+        help="Debug directories to search for symbols (Absolute path)",
     )
     parser.add_argument(
         "--conf", type=str, default=DEFAULT_CONF_PATH, help="Config path"
