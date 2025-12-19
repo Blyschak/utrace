@@ -554,12 +554,10 @@ class Tracer:
                 reporter = PerfettoReporter()
             case _:
                 raise ValueError(f"Invalid reporter: {reporter_name}")
-        # Open pipe to read from `perf script`:
-        r, w = os.pipe()
-        r = os.fdopen(r, "r", encoding="utf-8")
-        w = os.fdopen(w, "w", encoding="utf-8")
-        self.perf.report(w)
-        w.close()
+
+        with open("out.perf", "w") as outfile:
+            self.perf.report(outfile)
+
         # Time sync events:
         for _ in range(3):
             # REALTIME (wall clock, same as system time)
@@ -572,29 +570,30 @@ class Tracer:
                 "boottime": boottime,
             }
             reporter.on_event(event)
-        # Read from pipe:
-        for line in r.readlines():
-            command, pid_tid, time_str, event = line.split()
-            pid, tid = pid_tid.split("/")
-            time_str = time_str.rstrip(":")
-            time_ns = int(float(time_str) * 1e9)
-            event = event.rstrip(":")
-            _group, name = event.split(":")
-            exename, offset, *_ = name.split("_")
-            offset = "0x" + offset
-            is_return = event.endswith("_return")
-            symbol_name = self.probes[exename]["symbols"][offset]
-            kind = "enter" if not is_return else "exit"
-            event = {
-                "event": "probe",
-                "command": command,
-                "pid": pid,
-                "tid": tid,
-                "time_ns": time_ns,
-                "kind": kind,
-                "func": symbol_name,
-            }
-            reporter.on_event(event)
+
+        with open("out.perf") as outfile:
+            for line in outfile.readlines():
+                command, pid_tid, time_str, event = line.split()
+                pid, tid = pid_tid.split("/")
+                time_str = time_str.rstrip(":")
+                time_ns = int(float(time_str) * 1e9)
+                event = event.rstrip(":")
+                _group, name = event.split(":")
+                exename, offset, *_ = name.split("_")
+                offset = "0x" + offset
+                is_return = event.endswith("_return")
+                symbol_name = self.probes[exename]["symbols"][offset]
+                kind = "enter" if not is_return else "exit"
+                event = {
+                    "event": "probe",
+                    "command": command,
+                    "pid": pid,
+                    "tid": tid,
+                    "time_ns": time_ns,
+                    "kind": kind,
+                    "func": symbol_name,
+                }
+                reporter.on_event(event)
         reporter.end_of_events()
 
     def _read_probes(self) -> dict:
